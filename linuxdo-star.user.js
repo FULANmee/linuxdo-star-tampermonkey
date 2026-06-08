@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LinuxDo Star - Tampermonkey
 // @namespace    https://github.com/FULANmee/linuxdo-star-tampermonkey
-// @version      1.0.0
+// @version      1.1.0
 // @description  为 linux.do 添加帖子和评论收藏功能，支持收藏夹、管理面板、导入导出和 GitHub Gist 同步
 // @author       FULANmee; based on codedogQBY/LinuxDoStar
 // @license      MIT
@@ -24,6 +24,7 @@
 
   const STORAGE_KEY = 'linuxdo_stars';
   const SYNC_CONFIG_KEY = 'linuxdo_sync_config';
+  const UI_CONFIG_KEY = 'linuxdo_ui_config';
   const GIST_FILENAME = 'linuxdo-stars.json';
   const GIST_DESCRIPTION = 'LinuxDo Star Collector - Sync Data (do not delete)';
 
@@ -42,16 +43,20 @@
   const MAX_POSTS_PER_TOPIC = 800;
   const MAX_TAGS = 40;
   const MAX_GITHUB_RESPONSE_BYTES = 10 * 1024 * 1024;
+  const ORDER_STEP = 1000;
+  const DRAG_MIME = 'application/x-linuxdo-star';
 
   const managerState = {
     store: null,
     currentView: 'all',
-    sort: 'newest',
+    sort: 'custom',
     query: '',
     expanded: new Set(),
     batchMode: false,
     selected: new Set(),
     panelOpen: false,
+    dragging: null,
+    ignoreNextClick: false,
   };
 
   let activePopup = null;
@@ -121,6 +126,11 @@
     return Number.isFinite(number) && number >= 0 ? number : fallback;
   }
 
+  function safeNumber(value, fallback = 0) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? number : fallback;
+  }
+
   function safeBool(value, fallback = false) {
     return typeof value === 'boolean' ? value : fallback;
   }
@@ -151,6 +161,16 @@
 
   function safeCollectionId(value) {
     return safeId(value, 'default') || 'default';
+  }
+
+  function safeOrderByCollection(value) {
+    const result = {};
+    for (const [key, order] of safeEntries(value)) {
+      const id = safeCollectionId(key);
+      if (!id) continue;
+      result[id] = safeNumber(order, 0);
+    }
+    return result;
   }
 
   function safeTopicKey(key, bookmark) {
@@ -199,6 +219,13 @@
       status: ALLOWED_SYNC_STATUS.has(status) ? status : 'disconnected',
       username: safeString(raw.username, '', 120),
       lastError: safeString(raw.lastError, '', 500),
+    };
+  }
+
+  function normalizeUiConfig(input) {
+    const raw = isObject(input) ? input : {};
+    return {
+      showFab: safeBool(raw.showFab, true),
     };
   }
 
@@ -268,6 +295,7 @@
       collectionId: safeCollectionId(input?.collectionId),
       tags: safeTags(input?.tags),
       note: safeString(input?.note, '', 5000),
+      orderByCollection: safeOrderByCollection(input?.orderByCollection),
       posts: {},
     };
 
@@ -334,7 +362,7 @@
       if (!collectionIds.has(bookmark.collectionId)) bookmark.collectionId = 'default';
       for (const post of Object.values(bookmark.posts || {})) {
         if (!post || post._deleted) continue;
-        if (!collectionIds.has(post.collectionId)) post.collectionId = bookmark.collectionId || 'default';
+        post.collectionId = bookmark.collectionId || 'default';
       }
     }
 
@@ -343,6 +371,93 @@
 
   function clone(data) {
     return JSON.parse(JSON.stringify(data));
+  }
+
+  function collectionSortValue(collection) {
+    if (collection?.id === 'default') return -1;
+    return safeNumber(collection?.order, Number.MAX_SAFE_INTEGER);
+  }
+
+  function sortedCollections(store) {
+    return aliveCollections(store)
+      .map(([, collection]) => collection)
+      .sort((a, b) => {
+        if (a.id === 'default') return -1;
+        if (b.id === 'default') return 1;
+        const orderDiff = collectionSortValue(a) - collectionSortValue(b);
+        if (orderDiff) return orderDiff;
+        return (a.name || '').localeCompare(b.name || '', 'zh-CN');
+      });
+  }
+
+  function collectionItemOrder(bookmark, collectionId) {
+    const id = safeCollectionId(collectionId);
+    const explicit = bookmark?.orderByCollection?.[id];
+    if (Number.isFinite(explicit)) return explicit;
+    const time = new Date(bookmark?.starredAt || bookmark?.updatedAt || bookmark?.createdAt || 0).getTime();
+    return Number.isFinite(time) ? Number.MAX_SAFE_INTEGER - time : Number.MAX_SAFE_INTEGER;
+  }
+
+  function sortBookmarksByCustomOrder(items, collectionId) {
+    return items.sort((a, b) => {
+      const diff = collectionItemOrder(a, collectionId) - collectionItemOrder(b, collectionId);
+      if (diff) return diff;
+      return new Date(b.starredAt || b.updatedAt || 0) - new Date(a.starredAt || a.updatedAt || 0);
+    });
+  }
+
+  function collectionBookmarks(store, collectionId) {
+    const id = safeCollectionId(collectionId);
+    return aliveBookmarks(store)
+      .filter(([, bookmark]) => (bookmark.collectionId || 'default') === id)
+      .map(([key, bookmark]) => ({ key, ...bookmark }));
+  }
+
+  function assignCollectionOrders(store, collectionIds) {
+    const ids = collectionIds.filter(id => id && id !== 'default' && store.collections[id] && !store.collections[id]._deleted);
+    const time = nowIso();
+    store.collections.default = { ...makeDefaultCollection(), ...(store.collections.default || {}), id: 'default', order: 0, updatedAt: time };
+    ids.forEach((id, index) => {
+      store.collections[id].order = (index + 1) * ORDER_STEP;
+      store.collections[id].updatedAt = time;
+    });
+  }
+
+  function setTopicCollectionOrder(store, topicKey, collectionId, order) {
+    const topic = store.bookmarks?.[topicKey];
+    if (!topic || topic._deleted) return;
+    const id = safeCollectionId(collectionId);
+    if (!topic.orderByCollection) topic.orderByCollection = {};
+    topic.orderByCollection[id] = safeNumber(order, 0);
+  }
+
+  function reindexCollectionItems(store, collectionId, topicKeys, time = nowIso()) {
+    const id = safeCollectionId(collectionId);
+    topicKeys.forEach((topicKey, index) => {
+      setTopicCollectionOrder(store, topicKey, id, (index + 1) * ORDER_STEP);
+      if (store.bookmarks?.[topicKey] && !store.bookmarks[topicKey]._deleted) {
+        store.bookmarks[topicKey].updatedAt = time;
+      }
+    });
+  }
+
+  function removeTopicCollectionOrder(topic, collectionId) {
+    const id = safeCollectionId(collectionId);
+    if (topic?.orderByCollection) delete topic.orderByCollection[id];
+  }
+
+  function placeTopicAtCollectionTop(store, topicKey, collectionId, time = nowIso()) {
+    const id = safeCollectionId(collectionId);
+    const current = sortBookmarksByCustomOrder(collectionBookmarks(store, id), id).filter(item => item.key !== topicKey);
+    const firstOrder = current.length ? collectionItemOrder(current[0], id) : ORDER_STEP * 2;
+    if (firstOrder > 1) {
+      setTopicCollectionOrder(store, topicKey, id, firstOrder / 2);
+      if (store.bookmarks?.[topicKey] && !store.bookmarks[topicKey]._deleted) {
+        store.bookmarks[topicKey].updatedAt = time;
+      }
+      return;
+    }
+    reindexCollectionItems(store, id, [topicKey, ...current.map(item => item.key)], time);
   }
 
   function alivePosts(bookmark) {
@@ -425,6 +540,78 @@
     }, 1900);
   }
 
+  function setDragPayload(event, payload) {
+    managerState.dragging = payload;
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData(DRAG_MIME, JSON.stringify(payload));
+    event.dataTransfer.setData('text/plain', payload.topicKey || payload.collectionId || '');
+  }
+
+  function getDragPayload(event) {
+    if (managerState.dragging) return managerState.dragging;
+    try {
+      const raw = event.dataTransfer.getData(DRAG_MIME);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function getDropPosition(event, element) {
+    const rect = element.getBoundingClientRect();
+    return event.clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+  }
+
+  function clearDragMarks(root = document) {
+    root.querySelectorAll('.ldsm-dragging, .ldsm-drag-over, .ldsm-drag-before, .ldsm-drag-after')
+      .forEach(element => element.classList.remove('ldsm-dragging', 'ldsm-drag-over', 'ldsm-drag-before', 'ldsm-drag-after'));
+  }
+
+  function markDragTarget(element, position) {
+    const root = element.parentElement || document;
+    root.querySelectorAll('.ldsm-drag-over, .ldsm-drag-before, .ldsm-drag-after')
+      .forEach(item => item.classList.remove('ldsm-drag-over', 'ldsm-drag-before', 'ldsm-drag-after'));
+    element.classList.add('ldsm-drag-over', position === 'before' ? 'ldsm-drag-before' : 'ldsm-drag-after');
+  }
+
+  function reorderIds(ids, movingId, targetId, position) {
+    const next = ids.filter(id => id !== movingId);
+    let index = next.indexOf(targetId);
+    if (index < 0) index = next.length;
+    else if (position === 'after') index += 1;
+    next.splice(index, 0, movingId);
+    return next;
+  }
+
+  function canReorderCurrentView() {
+    return managerState.currentView !== 'all' && managerState.sort === 'custom' && !managerState.query && !managerState.batchMode;
+  }
+
+  function suppressNextClick() {
+    managerState.ignoreNextClick = true;
+    setTimeout(() => {
+      managerState.ignoreNextClick = false;
+    }, 120);
+  }
+
+  function getUiConfig() {
+    return normalizeUiConfig(GM_getValue(UI_CONFIG_KEY, {}));
+  }
+
+  function saveUiConfig(updates) {
+    const next = normalizeUiConfig({ ...getUiConfig(), ...updates });
+    GM_setValue(UI_CONFIG_KEY, next);
+    applyUiConfig(next);
+    return next;
+  }
+
+  function applyUiConfig(config = getUiConfig()) {
+    const fab = $('#ldsmFab');
+    if (fab) fab.hidden = !config.showFab;
+    const toggle = $('#ldsmFabToggle');
+    if (toggle) toggle.checked = config.showFab;
+  }
+
   // ========================= Storage =========================
   const StarStorage = {
     async getAll() {
@@ -447,7 +634,7 @@
     async createCollection(name, icon, color) {
       const store = await this.getAll();
       const id = makeId('col');
-      const order = aliveCollections(store).length;
+      const order = Math.max(0, ...sortedCollections(store).filter(col => col.id !== 'default').map(col => safeNumber(col.order, 0))) + ORDER_STEP;
       const time = nowIso();
       store.collections[id] = {
         id,
@@ -460,6 +647,12 @@
       };
       await this.save(store);
       return id;
+    },
+
+    async reorderCollections(collectionIds) {
+      const store = await this.getAll();
+      assignCollectionOrders(store, collectionIds);
+      await this.save(store);
     },
 
     async updateCollection(id, updates) {
@@ -480,12 +673,14 @@
       };
       for (const bookmark of Object.values(store.bookmarks || {})) {
         if (!bookmark || bookmark._deleted) continue;
-        if (bookmark.collectionId === id) {
+        const wasInDeletedCollection = bookmark.collectionId === id;
+        if (wasInDeletedCollection) {
           bookmark.collectionId = 'default';
+          removeTopicCollectionOrder(bookmark, id);
           bookmark.updatedAt = time;
         }
         for (const post of Object.values(bookmark.posts || {})) {
-          if (post && !post._deleted && post.collectionId === id) {
+          if (post && !post._deleted && (post.collectionId === id || wasInDeletedCollection)) {
             post.collectionId = 'default';
             post.updatedAt = time;
             bookmark.updatedAt = time;
@@ -543,6 +738,7 @@
           posts: {},
         };
       } else {
+        const previousCollectionId = liveCollectionId(store, existing.collectionId);
         existing.starred = true;
         existing.starredAt = time;
         existing.updatedAt = time;
@@ -551,8 +747,15 @@
         existing.category = meta.category || existing.category || '';
         existing.tags = meta.tags?.length ? meta.tags : (existing.tags || []);
         existing.collectionId = targetCollectionId || liveCollectionId(store, existing.collectionId);
+        if (previousCollectionId !== targetCollectionId) removeTopicCollectionOrder(existing, previousCollectionId);
+        for (const post of Object.values(existing.posts || {})) {
+          if (!post || post._deleted) continue;
+          post.collectionId = existing.collectionId;
+          post.updatedAt = time;
+        }
       }
 
+      placeTopicAtCollectionTop(store, key, targetCollectionId, time);
       await this.save(store);
       return true;
     },
@@ -582,6 +785,7 @@
 
       const topic = store.bookmarks[topicKey];
       if (!topic.posts) topic.posts = {};
+      const previousCollectionId = liveCollectionId(store, topic.collectionId);
 
       if (topic.posts[postKey] && !topic.posts[postKey]._deleted) {
         topic.posts[postKey] = {
@@ -616,6 +820,14 @@
       topic.updatedAt = time;
       topic.topicTitle = topicMeta.title || topic.topicTitle;
       topic.topicUrl = topicMeta.url || topic.topicUrl;
+      topic.collectionId = targetCollectionId;
+      if (previousCollectionId !== targetCollectionId) removeTopicCollectionOrder(topic, previousCollectionId);
+      for (const post of Object.values(topic.posts || {})) {
+        if (!post || post._deleted) continue;
+        post.collectionId = targetCollectionId;
+        post.updatedAt = time;
+      }
+      placeTopicAtCollectionTop(store, topicKey, targetCollectionId, time);
       await this.save(store);
       return true;
     },
@@ -624,17 +836,31 @@
       const store = await this.getAll();
       const time = nowIso();
       const targetCollectionId = liveCollectionId(store, collectionId);
-      if (postKey) {
-        const post = store.bookmarks[topicKey]?.posts?.[postKey];
-        if (post && !post._deleted) {
+      const topic = store.bookmarks[topicKey];
+      if (topic && !topic._deleted) {
+        const previousCollectionId = liveCollectionId(store, topic.collectionId);
+        topic.collectionId = targetCollectionId;
+        topic.updatedAt = time;
+        for (const post of Object.values(topic.posts || {})) {
+          if (!post || post._deleted) continue;
           post.collectionId = targetCollectionId;
           post.updatedAt = time;
-          store.bookmarks[topicKey].updatedAt = time;
         }
-      } else if (store.bookmarks[topicKey] && !store.bookmarks[topicKey]._deleted) {
-        store.bookmarks[topicKey].collectionId = targetCollectionId;
-        store.bookmarks[topicKey].updatedAt = time;
+        if (previousCollectionId !== targetCollectionId) removeTopicCollectionOrder(topic, previousCollectionId);
+        placeTopicAtCollectionTop(store, topicKey, targetCollectionId, time);
       }
+      await this.save(store);
+    },
+
+    async reorderTopics(collectionId, topicKeys) {
+      const store = await this.getAll();
+      const id = liveCollectionId(store, collectionId);
+      const allowed = new Set(collectionBookmarks(store, id).map(item => item.key));
+      const ordered = topicKeys.filter(key => allowed.has(key));
+      const missing = sortBookmarksByCustomOrder(collectionBookmarks(store, id), id)
+        .map(item => item.key)
+        .filter(key => !ordered.includes(key));
+      reindexCollectionItems(store, id, [...ordered, ...missing]);
       await this.save(store);
     },
 
@@ -1215,7 +1441,7 @@
   async function showCollectionPicker(button, { topicId, postNumber, topicMeta, postMeta }) {
     closeCollectionPicker();
     const store = await StarStorage.getAll();
-    const collections = aliveCollections(store).map(([, collection]) => collection).sort((a, b) => (a.order || 0) - (b.order || 0));
+    let collections = sortedCollections(store);
     const topicKey = `topic_${topicId}`;
     const currentCollectionId = postNumber
       ? store.bookmarks[topicKey]?.posts?.[`post_${postNumber}`]?.collectionId
@@ -1238,6 +1464,7 @@
       </button>
     `;
 
+    let pickerFilter = '';
     const renderList = (filter = '') => {
       const list = popup.querySelector('.ldsm-picker-list');
       const query = filter.toLowerCase().trim();
@@ -1250,16 +1477,8 @@
         return;
       }
 
-      const sorted = [...filtered].sort((a, b) => {
-        if (a.id === 'default') return -1;
-        if (b.id === 'default') return 1;
-        if (a.id === currentCollectionId) return -1;
-        if (b.id === currentCollectionId) return 1;
-        return a.name.localeCompare(b.name, 'zh-CN');
-      });
-
-      list.innerHTML = sorted.map(col => `
-        <button class="ldsm-picker-item${col.id === currentCollectionId ? ' active' : ''}" data-cid="${attr(col.id)}" type="button">
+      list.innerHTML = filtered.map(col => `
+        <button class="ldsm-picker-item${col.id === currentCollectionId ? ' active' : ''}" data-cid="${attr(col.id)}" type="button" ${!query && col.id !== 'default' ? 'draggable="true"' : ''}>
           <span class="ldsm-picker-icon">${h(col.icon || '📁')}</span>
           <span class="ldsm-picker-name">${h(col.name)}</span>
           ${col.id === currentCollectionId ? '<span class="ldsm-picker-check">✓</span>' : ''}
@@ -1268,10 +1487,46 @@
     };
 
     renderList();
-    popup.querySelector('.ldsm-picker-search').addEventListener('input', event => renderList(event.target.value));
+    popup.querySelector('.ldsm-picker-search').addEventListener('input', event => {
+      pickerFilter = event.target.value;
+      renderList(pickerFilter);
+    });
     popup.querySelector('.ldsm-picker-search').addEventListener('keydown', event => {
       if (event.key === 'Enter') popup.querySelector('.ldsm-picker-list .ldsm-picker-item')?.click();
     });
+    const pickerList = popup.querySelector('.ldsm-picker-list');
+    pickerList.addEventListener('dragstart', event => {
+      if (pickerFilter.trim()) return;
+      const item = event.target.closest('.ldsm-picker-item[data-cid]');
+      if (!item || item.dataset.cid === 'default') return;
+      setDragPayload(event, { type: 'picker-collection', collectionId: item.dataset.cid });
+      item.classList.add('ldsm-dragging');
+    });
+    pickerList.addEventListener('dragover', event => {
+      const payload = getDragPayload(event);
+      if (!payload || payload.type !== 'picker-collection' || pickerFilter.trim()) return;
+      const item = event.target.closest('.ldsm-picker-item[data-cid]');
+      if (!item || item.dataset.cid === 'default' || item.dataset.cid === payload.collectionId) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+      markDragTarget(item, getDropPosition(event, item));
+    });
+    pickerList.addEventListener('dragleave', handleDragLeave);
+    pickerList.addEventListener('drop', async event => {
+      const payload = getDragPayload(event);
+      const item = event.target.closest('.ldsm-picker-item[data-cid]');
+      if (!payload || payload.type !== 'picker-collection' || !item || item.dataset.cid === 'default' || item.dataset.cid === payload.collectionId) return;
+      event.preventDefault();
+      const position = getDropPosition(event, item);
+      const ids = sortedCollections(await StarStorage.getAll()).map(col => col.id).filter(id => id !== 'default');
+      await StarStorage.reorderCollections(reorderIds(ids, payload.collectionId, item.dataset.cid, position));
+      collections = sortedCollections(await StarStorage.getAll());
+      clearDragMarks(popup);
+      renderList(pickerFilter);
+      if (isManagerOpen()) await reloadManager();
+      suppressNextClick();
+    });
+    pickerList.addEventListener('dragend', handleDragEnd);
 
     const rect = button.getBoundingClientRect();
     popup.style.top = `${Math.min(window.innerHeight - 16, rect.bottom + 6)}px`;
@@ -1279,6 +1534,10 @@
 
     popup.addEventListener('click', async event => {
       event.stopPropagation();
+      if (managerState.ignoreNextClick) {
+        event.preventDefault();
+        return;
+      }
       const newButton = event.target.closest('[data-action="new-collection"]');
       if (newButton) {
         newButton.outerHTML = `
@@ -1452,6 +1711,7 @@
             <button class="ldsm-btn ldsm-btn-outline ldsm-btn-full ldsm-sync-button" id="ldsmSyncButton" type="button">
               ${svgSync()}<span id="ldsmSyncText">同步设置</span>
             </button>
+            <label class="ldsm-check-label ldsm-sidebar-toggle"><input type="checkbox" id="ldsmFabToggle"> 右下角悬浮入口</label>
             <div class="ldsm-total" id="ldsmTotal"></div>
           </div>
           <div class="ldsm-sidebar-foot">
@@ -1473,6 +1733,7 @@
               </div>
               <label class="ldsm-check-label"><input type="checkbox" id="ldsmBatchMode"> 多选</label>
               <select class="ldsm-select" id="ldsmSort">
+                <option value="custom">自定义排序</option>
                 <option value="newest">最新收藏</option>
                 <option value="oldest">最早收藏</option>
                 <option value="title">按标题</option>
@@ -1524,9 +1785,23 @@
     });
     $('#ldsmBatchDelete').addEventListener('click', batchDelete);
     $('#ldsmNav').addEventListener('click', handleNavClick);
+    $('#ldsmNav').addEventListener('dragstart', handleNavDragStart);
+    $('#ldsmNav').addEventListener('dragover', handleNavDragOver);
+    $('#ldsmNav').addEventListener('dragleave', handleDragLeave);
+    $('#ldsmNav').addEventListener('drop', handleNavDrop);
+    $('#ldsmNav').addEventListener('dragend', handleDragEnd);
     $('#ldsmContent').addEventListener('click', handleContentClick);
+    $('#ldsmContent').addEventListener('dragstart', handleContentDragStart);
+    $('#ldsmContent').addEventListener('dragover', handleContentDragOver);
+    $('#ldsmContent').addEventListener('dragleave', handleDragLeave);
+    $('#ldsmContent').addEventListener('drop', handleContentDrop);
+    $('#ldsmContent').addEventListener('dragend', handleDragEnd);
     $('#ldsmNewCollection').addEventListener('click', createCollectionFromManager);
     $('#ldsmSyncButton').addEventListener('click', openSyncPanel);
+    $('#ldsmFabToggle').addEventListener('change', event => {
+      saveUiConfig({ showFab: event.target.checked });
+      showToast(event.target.checked ? '已显示悬浮入口' : '已隐藏悬浮入口');
+    });
     $('#ldsmExport').addEventListener('click', exportStore);
     $('#ldsmImport').addEventListener('click', () => $('#ldsmImportFile').click());
     $('#ldsmImportFile').addEventListener('change', importStore);
@@ -1536,6 +1811,7 @@
       if (managerState.panelOpen) closePanel();
       else if (isManagerOpen()) closeManager();
     });
+    applyUiConfig();
   }
 
   function $(selector) {
@@ -1593,13 +1869,13 @@
     const postCount = aliveBookmarks(store).reduce((total, [, bookmark]) => total + alivePosts(bookmark).length, 0);
     $('#ldsmTotal').textContent = `${counts.all || 0} 帖 · ${postCount} 评`;
 
-    const collections = aliveCollections(store).map(([, collection]) => collection).sort((a, b) => (a.order || 0) - (b.order || 0));
+    const collections = sortedCollections(store);
     $('#ldsmNav').innerHTML = `
       <button class="ldsm-nav-item${managerState.currentView === 'all' ? ' active' : ''}" data-view="all" type="button">
         ${svgHome()}<span>全部</span><span class="ldsm-nav-count">${counts.all || 0}</span>
       </button>
       ${collections.map(col => `
-        <button class="ldsm-nav-item${managerState.currentView === col.id ? ' active' : ''}" data-view="${attr(col.id)}" type="button">
+        <button class="ldsm-nav-item${managerState.currentView === col.id ? ' active' : ''}" data-view="${attr(col.id)}" type="button" ${col.id !== 'default' ? 'draggable="true"' : ''}>
           <span class="ldsm-nav-icon">${h(col.icon || '📁')}</span>
           <span class="ldsm-nav-name">${h(col.name)}</span>
           <span class="ldsm-nav-count">${counts[col.id] || 0}</span>
@@ -1628,11 +1904,28 @@
       if (match) items.push({ key, ...bookmark });
     }
 
-    items.sort((a, b) => {
-      if (managerState.sort === 'oldest') return new Date(a.starredAt || a.updatedAt || 0) - new Date(b.starredAt || b.updatedAt || 0);
-      if (managerState.sort === 'title') return (a.topicTitle || '').localeCompare(b.topicTitle || '', 'zh-CN');
-      return new Date(b.starredAt || b.updatedAt || 0) - new Date(a.starredAt || a.updatedAt || 0);
-    });
+    if (managerState.sort === 'custom') {
+      if (managerState.currentView === 'all') {
+        const collectionsById = new Map(sortedCollections(store).map(col => [col.id, col]));
+        items.sort((a, b) => {
+          const ac = a.collectionId || 'default';
+          const bc = b.collectionId || 'default';
+          const collectionDiff = collectionSortValue(collectionsById.get(ac)) - collectionSortValue(collectionsById.get(bc));
+          if (collectionDiff) return collectionDiff;
+          const orderDiff = collectionItemOrder(a, ac) - collectionItemOrder(b, bc);
+          if (orderDiff) return orderDiff;
+          return new Date(b.starredAt || b.updatedAt || 0) - new Date(a.starredAt || a.updatedAt || 0);
+        });
+      } else {
+        sortBookmarksByCustomOrder(items, managerState.currentView);
+      }
+    } else {
+      items.sort((a, b) => {
+        if (managerState.sort === 'oldest') return new Date(a.starredAt || a.updatedAt || 0) - new Date(b.starredAt || b.updatedAt || 0);
+        if (managerState.sort === 'title') return (a.topicTitle || '').localeCompare(b.topicTitle || '', 'zh-CN');
+        return new Date(b.starredAt || b.updatedAt || 0) - new Date(a.starredAt || a.updatedAt || 0);
+      });
+    }
 
     if (!items.length) {
       content.innerHTML = `
@@ -1656,7 +1949,7 @@
     const collection = store.collections[item.collectionId] || store.collections.default;
 
     return `
-      <div class="ldsm-card${isOpen ? ' open' : ''}" data-key="${attr(item.key)}">
+      <div class="ldsm-card${isOpen ? ' open' : ''}${canReorderCurrentView() ? ' ldsm-card-sortable' : ''}" data-key="${attr(item.key)}" ${!managerState.batchMode ? 'draggable="true"' : ''}>
         <div class="ldsm-card-head">
           ${managerState.batchMode
             ? `<input type="checkbox" class="ldsm-card-check" data-key="${attr(item.key)}" ${managerState.selected.has(item.key) ? 'checked' : ''}>`
@@ -1671,7 +1964,7 @@
               ${(item.tags || []).length > 3 ? `<span class="ldsm-tag">+${item.tags.length - 3}</span>` : ''}
               ${item.note ? '<span class="ldsm-tag ldsm-tag-note">备注</span>' : ''}
               <span class="ldsm-time">${formatTime(item.starredAt || item.updatedAt)}</span>
-              ${posts.length ? `<span class="ldsm-tag">${posts.length} 评论</span>` : ''}
+              ${posts.length ? `<span class="ldsm-tag ldsm-comment-count">${posts.length} 评论</span>` : ''}
             </div>
           </div>
           <div class="ldsm-card-actions">
@@ -1682,7 +1975,7 @@
         </div>
         ${posts.length ? `<div class="ldsm-card-posts">
           ${posts.map(post => `
-            <div class="ldsm-post-row" data-url="${attr(post.postUrl)}">
+            <div class="ldsm-post-row" data-url="${attr(post.postUrl)}" data-tkey="${attr(item.key)}" ${!managerState.batchMode ? 'draggable="true"' : ''}>
               <span class="ldsm-post-num">#${h(post.postNumber)}</span>
               <div class="ldsm-post-info">
                 <span class="ldsm-post-author">@${h(post.author || '?')}</span>
@@ -1703,6 +1996,10 @@
   }
 
   function handleNavClick(event) {
+    if (managerState.ignoreNextClick) {
+      event.preventDefault();
+      return;
+    }
     const edit = event.target.closest('[data-act="edit-col"]');
     if (edit) {
       event.stopPropagation();
@@ -1717,7 +2014,60 @@
     renderManager();
   }
 
+  function handleNavDragStart(event) {
+    const item = event.target.closest('.ldsm-nav-item[data-view]');
+    if (!item || item.dataset.view === 'all' || item.dataset.view === 'default' || event.target.closest('[data-act]')) return;
+    setDragPayload(event, { type: 'manager-collection', collectionId: item.dataset.view });
+    item.classList.add('ldsm-dragging');
+  }
+
+  function handleNavDragOver(event) {
+    const payload = getDragPayload(event);
+    const item = event.target.closest('.ldsm-nav-item[data-view]');
+    if (!payload || !item || item.dataset.view === 'all') return;
+
+    if (payload.type === 'manager-collection') {
+      if (item.dataset.view === 'default' || item.dataset.view === payload.collectionId) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+      markDragTarget(item, getDropPosition(event, item));
+      return;
+    }
+
+    if (payload.type === 'topic') {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+      item.classList.add('ldsm-drag-over');
+    }
+  }
+
+  async function handleNavDrop(event) {
+    const payload = getDragPayload(event);
+    const item = event.target.closest('.ldsm-nav-item[data-view]');
+    if (!payload || !item || item.dataset.view === 'all') return;
+    event.preventDefault();
+
+    if (payload.type === 'manager-collection') {
+      if (item.dataset.view === 'default' || item.dataset.view === payload.collectionId) return;
+      const position = getDropPosition(event, item);
+      const ids = sortedCollections(await StarStorage.getAll()).map(col => col.id).filter(id => id !== 'default');
+      await StarStorage.reorderCollections(reorderIds(ids, payload.collectionId, item.dataset.view, position));
+      showToast('已调整收藏夹顺序');
+    } else if (payload.type === 'topic') {
+      await StarStorage.moveToCollection(payload.topicKey, item.dataset.view, null);
+      showToast('已移动到收藏夹');
+    }
+
+    clearDragMarks();
+    await reloadManager();
+    suppressNextClick();
+  }
+
   async function handleContentClick(event) {
+    if (managerState.ignoreNextClick) {
+      event.preventDefault();
+      return;
+    }
     const checkbox = event.target.closest('.ldsm-card-check');
     if (checkbox) {
       const key = checkbox.dataset.key;
@@ -1761,6 +2111,57 @@
     card.classList.toggle('open');
     if (managerState.expanded.has(key)) managerState.expanded.delete(key);
     else managerState.expanded.add(key);
+  }
+
+  function handleContentDragStart(event) {
+    if (managerState.batchMode || event.target.closest('[data-act], a, input, textarea, select, button')) return;
+    const row = event.target.closest('.ldsm-post-row[data-tkey]');
+    const card = event.target.closest('.ldsm-card[data-key]');
+    const topicKey = row?.dataset.tkey || card?.dataset.key;
+    const dragElement = row || card;
+    if (!topicKey || !dragElement) return;
+    setDragPayload(event, {
+      type: 'topic',
+      topicKey,
+      sourceCollectionId: managerState.currentView,
+    });
+    dragElement.classList.add('ldsm-dragging');
+  }
+
+  function handleContentDragOver(event) {
+    const payload = getDragPayload(event);
+    if (!payload || payload.type !== 'topic' || !canReorderCurrentView()) return;
+    const card = event.target.closest('.ldsm-card[data-key]');
+    if (!card || card.dataset.key === payload.topicKey) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    markDragTarget(card, getDropPosition(event, card));
+  }
+
+  async function handleContentDrop(event) {
+    const payload = getDragPayload(event);
+    if (!payload || payload.type !== 'topic' || !canReorderCurrentView()) return;
+    const card = event.target.closest('.ldsm-card[data-key]');
+    if (!card || card.dataset.key === payload.topicKey) return;
+    event.preventDefault();
+    const ids = Array.from($('#ldsmContent').querySelectorAll('.ldsm-card[data-key]')).map(item => item.dataset.key);
+    const nextIds = reorderIds(ids, payload.topicKey, card.dataset.key, getDropPosition(event, card));
+    await StarStorage.reorderTopics(managerState.currentView, nextIds);
+    clearDragMarks();
+    await reloadManager();
+    showToast('已调整收藏顺序');
+    suppressNextClick();
+  }
+
+  function handleDragLeave(event) {
+    const target = event.target.closest?.('.ldsm-nav-item, .ldsm-card, .ldsm-picker-item');
+    if (!target || target.contains(event.relatedTarget)) return;
+    target.classList.remove('ldsm-drag-over', 'ldsm-drag-before', 'ldsm-drag-after');
+  }
+
+  function handleDragEnd() {
+    clearDragMarks();
+    managerState.dragging = null;
   }
 
   async function createCollectionFromManager() {
@@ -1933,7 +2334,7 @@
   }
 
   function openMovePanel(topicKey, postKey) {
-    const collections = aliveCollections(managerState.store).map(([, collection]) => collection).sort((a, b) => (a.order || 0) - (b.order || 0));
+    const collections = sortedCollections(managerState.store);
     const current = postKey
       ? managerState.store.bookmarks[topicKey]?.posts?.[postKey]?.collectionId
       : managerState.store.bookmarks[topicKey]?.collectionId;
@@ -2200,6 +2601,12 @@
       .ldsm-picker-empty { padding: 12px 10px; text-align: center; color: #a1a1aa; font-size: 12px; }
       .ldsm-picker-item { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 9px; border: 0; background: transparent; border-radius: 5px; color: #09090b; cursor: pointer; text-align: left; }
       .ldsm-picker-item:hover, .ldsm-picker-item.active { background: #f4f4f5; }
+      .ldsm-picker-item[draggable="true"], .ldsm-nav-item[draggable="true"], .ldsm-card[draggable="true"], .ldsm-post-row[draggable="true"] { cursor: grab; }
+      .ldsm-picker-item[draggable="true"]:active, .ldsm-nav-item[draggable="true"]:active, .ldsm-card[draggable="true"]:active, .ldsm-post-row[draggable="true"]:active { cursor: grabbing; }
+      .ldsm-dragging { opacity: .48; }
+      .ldsm-drag-over { outline: 1px solid #93c5fd; background: #eff6ff !important; }
+      .ldsm-drag-before { box-shadow: inset 0 2px 0 #2563eb; }
+      .ldsm-drag-after { box-shadow: inset 0 -2px 0 #2563eb; }
       .ldsm-picker-icon { width: 18px; text-align: center; flex: 0 0 18px; }
       .ldsm-picker-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .ldsm-picker-check { color: #16a34a; font-weight: 700; }
@@ -2209,6 +2616,7 @@
 
       #ldsm-root, #ldsm-root * { box-sizing: border-box; }
       .ldsm-fab { position: fixed; right: 18px; bottom: 82px; z-index: 999990; width: 44px; height: 44px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid #e4e4e7; border-radius: 999px; background: #fff; color: #ca8a04; box-shadow: 0 8px 24px rgba(0,0,0,.16); cursor: pointer; }
+      .ldsm-fab[hidden] { display: none !important; }
       .ldsm-fab:hover { background: #fefce8; border-color: #fde68a; }
       .ldsm-fab-star { font-size: 22px; line-height: 1; }
       .ldsm-fab-count { position: absolute; top: -5px; right: -5px; min-width: 18px; height: 18px; display: none; align-items: center; justify-content: center; padding: 0 5px; border-radius: 999px; background: #18181b; color: #fff; font-size: 10px; font-weight: 700; }
@@ -2225,6 +2633,7 @@
       .ldsm-nav { flex: 1; min-height: 0; overflow-y: auto; padding: 7px; display: flex; flex-direction: column; gap: 2px; }
       .ldsm-nav-item { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 32px; padding: 6px 9px; border: 0; border-radius: 6px; background: transparent; color: #71717a; cursor: pointer; text-align: left; font-size: 13px; font-weight: 500; }
       .ldsm-nav-item:hover, .ldsm-nav-item.active { background: #f4f4f5; color: #09090b; }
+      .ldsm-nav-item.ldsm-drag-over { color: #1d4ed8; }
       .ldsm-nav-item svg { width: 16px; height: 16px; flex: 0 0 16px; }
       .ldsm-nav-icon { width: 16px; text-align: center; }
       .ldsm-nav-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2233,6 +2642,7 @@
       .ldsm-nav-item:hover .ldsm-nav-edit { opacity: 1; }
       .ldsm-nav-edit:hover { background: #e4e4e7; color: #09090b; }
       .ldsm-sidebar-mid { padding: 9px 10px; border-top: 1px solid #e4e4e7; display: flex; flex-direction: column; gap: 6px; }
+      .ldsm-sidebar-toggle { justify-content: center; padding-top: 2px; }
       .ldsm-sidebar-foot { padding: 10px; display: flex; gap: 6px; border-top: 1px solid #e4e4e7; flex-wrap: wrap; }
       .ldsm-total { font-size: 11px; color: #a1a1aa; text-align: center; }
 
@@ -2282,10 +2692,12 @@
       .ldsm-card-body { flex: 1; min-width: 0; }
       .ldsm-card-title { font-size: 13px; font-weight: 600; color: #09090b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .ldsm-card-title a { color: inherit; text-decoration: none; }
+      .ldsm-card-title a:visited { color: inherit; }
       .ldsm-card-title a:hover { color: #2563eb; text-decoration: underline; }
       .ldsm-card-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
       .ldsm-tag { display: inline-flex; align-items: center; height: 18px; padding: 0 5px; border-radius: 4px; background: #f4f4f5; color: #71717a; font-size: 10px; font-weight: 600; }
       .ldsm-tag-note { background: #fefce8; color: #a16207; }
+      .ldsm-comment-count { background: #eff6ff; color: #2563eb; }
       .ldsm-time { color: #a1a1aa; font-size: 11px; }
       .ldsm-card-actions, .ldsm-post-actions { display: flex; gap: 2px; flex: 0 0 auto; }
       .ldsm-card-posts { display: none; }
