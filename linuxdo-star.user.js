@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LinuxDo Star - Tampermonkey
 // @namespace    https://github.com/FULANmee/linuxdo-star-tampermonkey
-// @version      1.1.0
+// @version      1.1.1
 // @description  为 linux.do 添加帖子和评论收藏功能，支持收藏夹、管理面板、导入导出和 GitHub Gist 同步
 // @author       FULANmee; based on codedogQBY/LinuxDoStar
 // @license      MIT
@@ -1947,10 +1947,12 @@
       .sort((a, b) => new Date(b.starredAt || 0) - new Date(a.starredAt || 0));
     const isOpen = managerState.expanded.has(item.key);
     const collection = store.collections[item.collectionId] || store.collections.default;
+    const sortable = canReorderCurrentView();
 
     return `
-      <div class="ldsm-card${isOpen ? ' open' : ''}${canReorderCurrentView() ? ' ldsm-card-sortable' : ''}" data-key="${attr(item.key)}" ${!managerState.batchMode ? 'draggable="true"' : ''}>
+      <div class="ldsm-card${isOpen ? ' open' : ''}${sortable ? ' ldsm-card-sortable' : ''}" data-key="${attr(item.key)}" ${!managerState.batchMode ? 'draggable="true"' : ''}>
         <div class="ldsm-card-head">
+          ${sortable ? '<span class="ldsm-drag-handle" draggable="true" title="拖拽排序" aria-label="拖拽排序">⋮⋮</span>' : ''}
           ${managerState.batchMode
             ? `<input type="checkbox" class="ldsm-card-check" data-key="${attr(item.key)}" ${managerState.selected.has(item.key) ? 'checked' : ''}>`
             : svgChevron()}
@@ -2068,6 +2070,10 @@
       event.preventDefault();
       return;
     }
+    if (event.target.closest('.ldsm-drag-handle')) {
+      event.preventDefault();
+      return;
+    }
     const checkbox = event.target.closest('.ldsm-card-check');
     if (checkbox) {
       const key = checkbox.dataset.key;
@@ -2114,11 +2120,13 @@
   }
 
   function handleContentDragStart(event) {
-    if (managerState.batchMode || event.target.closest('[data-act], a, input, textarea, select, button')) return;
+    if (managerState.batchMode) return;
+    const handle = event.target.closest('.ldsm-drag-handle');
+    if (!handle && event.target.closest('[data-act], a, input, textarea, select, button')) return;
     const row = event.target.closest('.ldsm-post-row[data-tkey]');
     const card = event.target.closest('.ldsm-card[data-key]');
     const topicKey = row?.dataset.tkey || card?.dataset.key;
-    const dragElement = row || card;
+    const dragElement = handle ? card : (row || card);
     if (!topicKey || !dragElement) return;
     setDragPayload(event, {
       type: 'topic',
@@ -2602,7 +2610,7 @@
       .ldsm-picker-item { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 9px; border: 0; background: transparent; border-radius: 5px; color: #09090b; cursor: pointer; text-align: left; }
       .ldsm-picker-item:hover, .ldsm-picker-item.active { background: #f4f4f5; }
       .ldsm-picker-item[draggable="true"], .ldsm-nav-item[draggable="true"], .ldsm-card[draggable="true"], .ldsm-post-row[draggable="true"] { cursor: grab; }
-      .ldsm-picker-item[draggable="true"]:active, .ldsm-nav-item[draggable="true"]:active, .ldsm-card[draggable="true"]:active, .ldsm-post-row[draggable="true"]:active { cursor: grabbing; }
+      .ldsm-picker-item[draggable="true"]:active, .ldsm-nav-item[draggable="true"]:active, .ldsm-card[draggable="true"]:active, .ldsm-post-row[draggable="true"]:active, .ldsm-drag-handle:active { cursor: grabbing; }
       .ldsm-dragging { opacity: .48; }
       .ldsm-drag-over { outline: 1px solid #93c5fd; background: #eff6ff !important; }
       .ldsm-drag-before { box-shadow: inset 0 2px 0 #2563eb; }
@@ -2685,6 +2693,8 @@
       .ldsm-card { border: 1px solid #e4e4e7; border-radius: 8px; overflow: hidden; margin-bottom: 8px; background: #fff; }
       .ldsm-card-head { display: flex; align-items: center; gap: 10px; padding: 10px 13px; background: #fafafa; cursor: pointer; }
       .ldsm-card-head:hover { background: #f4f4f5; }
+      .ldsm-drag-handle { width: 18px; height: 28px; display: inline-flex; align-items: center; justify-content: center; flex: 0 0 18px; border-radius: 5px; color: #a1a1aa; cursor: grab; font-size: 13px; font-weight: 700; line-height: 1; user-select: none; }
+      .ldsm-drag-handle:hover { background: #e4e4e7; color: #52525b; }
       .ldsm-chevron { width: 14px; height: 14px; flex: 0 0 14px; color: #a1a1aa; transition: transform 150ms ease; }
       .ldsm-card.open .ldsm-chevron { transform: rotate(90deg); }
       .ldsm-card-check { width: 16px; height: 16px; accent-color: #18181b; flex: 0 0 16px; }
