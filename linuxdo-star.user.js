@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LinuxDo Star - Tampermonkey
 // @namespace    https://github.com/FULANmee/linuxdo-star-tampermonkey
-// @version      1.1.1
+// @version      1.1.2
 // @description  为 linux.do 添加帖子和评论收藏功能，支持收藏夹、管理面板、导入导出和 GitHub Gist 同步
 // @author       FULANmee; based on codedogQBY/LinuxDoStar
 // @license      MIT
@@ -44,6 +44,7 @@
   const MAX_TAGS = 40;
   const MAX_GITHUB_RESPONSE_BYTES = 10 * 1024 * 1024;
   const ORDER_STEP = 1000;
+  const ALL_ORDER_KEY = '__all__';
   const DRAG_MIME = 'application/x-linuxdo-star';
 
   const managerState = {
@@ -413,6 +414,17 @@
       .map(([key, bookmark]) => ({ key, ...bookmark }));
   }
 
+  function viewBookmarks(store, viewId) {
+    if (viewId === 'all' || viewId === ALL_ORDER_KEY) {
+      return aliveBookmarks(store).map(([key, bookmark]) => ({ key, ...bookmark }));
+    }
+    return collectionBookmarks(store, viewId);
+  }
+
+  function orderScopeId(store, viewId) {
+    return viewId === 'all' || viewId === ALL_ORDER_KEY ? ALL_ORDER_KEY : liveCollectionId(store, viewId);
+  }
+
   function assignCollectionOrders(store, collectionIds) {
     const ids = collectionIds.filter(id => id && id !== 'default' && store.collections[id] && !store.collections[id]._deleted);
     const time = nowIso();
@@ -448,7 +460,7 @@
 
   function placeTopicAtCollectionTop(store, topicKey, collectionId, time = nowIso()) {
     const id = safeCollectionId(collectionId);
-    const current = sortBookmarksByCustomOrder(collectionBookmarks(store, id), id).filter(item => item.key !== topicKey);
+    const current = sortBookmarksByCustomOrder(viewBookmarks(store, id), id).filter(item => item.key !== topicKey);
     const firstOrder = current.length ? collectionItemOrder(current[0], id) : ORDER_STEP * 2;
     if (firstOrder > 1) {
       setTopicCollectionOrder(store, topicKey, id, firstOrder / 2);
@@ -584,7 +596,7 @@
   }
 
   function canReorderCurrentView() {
-    return managerState.currentView !== 'all' && managerState.sort === 'custom' && !managerState.query && !managerState.batchMode;
+    return managerState.sort === 'custom' && !managerState.query && !managerState.batchMode;
   }
 
   function suppressNextClick() {
@@ -756,6 +768,7 @@
       }
 
       placeTopicAtCollectionTop(store, key, targetCollectionId, time);
+      placeTopicAtCollectionTop(store, key, ALL_ORDER_KEY, time);
       await this.save(store);
       return true;
     },
@@ -828,6 +841,7 @@
         post.updatedAt = time;
       }
       placeTopicAtCollectionTop(store, topicKey, targetCollectionId, time);
+      placeTopicAtCollectionTop(store, topicKey, ALL_ORDER_KEY, time);
       await this.save(store);
       return true;
     },
@@ -854,10 +868,11 @@
 
     async reorderTopics(collectionId, topicKeys) {
       const store = await this.getAll();
-      const id = liveCollectionId(store, collectionId);
-      const allowed = new Set(collectionBookmarks(store, id).map(item => item.key));
+      const id = orderScopeId(store, collectionId);
+      const sourceItems = viewBookmarks(store, id);
+      const allowed = new Set(sourceItems.map(item => item.key));
       const ordered = topicKeys.filter(key => allowed.has(key));
-      const missing = sortBookmarksByCustomOrder(collectionBookmarks(store, id), id)
+      const missing = sortBookmarksByCustomOrder(sourceItems, id)
         .map(item => item.key)
         .filter(key => !ordered.includes(key));
       reindexCollectionItems(store, id, [...ordered, ...missing]);
@@ -1906,16 +1921,7 @@
 
     if (managerState.sort === 'custom') {
       if (managerState.currentView === 'all') {
-        const collectionsById = new Map(sortedCollections(store).map(col => [col.id, col]));
-        items.sort((a, b) => {
-          const ac = a.collectionId || 'default';
-          const bc = b.collectionId || 'default';
-          const collectionDiff = collectionSortValue(collectionsById.get(ac)) - collectionSortValue(collectionsById.get(bc));
-          if (collectionDiff) return collectionDiff;
-          const orderDiff = collectionItemOrder(a, ac) - collectionItemOrder(b, bc);
-          if (orderDiff) return orderDiff;
-          return new Date(b.starredAt || b.updatedAt || 0) - new Date(a.starredAt || a.updatedAt || 0);
-        });
+        sortBookmarksByCustomOrder(items, ALL_ORDER_KEY);
       } else {
         sortBookmarksByCustomOrder(items, managerState.currentView);
       }
