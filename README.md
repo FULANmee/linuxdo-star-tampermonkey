@@ -16,7 +16,7 @@
 
 - 帖子标题旁星标收藏。
 - 评论操作栏星标收藏。
-- 鼠标悬停星标 500ms 选择收藏夹。
+- 鼠标悬停星标选择收藏夹。
 - 收藏夹创建、编辑、删除和移动。
 - 站内抽屉式收藏管理：搜索、排序、展开评论、批量删除、备注、标签。
 - JSON 导入和导出。
@@ -63,19 +63,3 @@ https://github.com/settings/tokens/new?scopes=gist&description=LinuxDo+Star+Sync
 本项目基于 [codedogQBY/LinuxDoStar](https://github.com/codedogQBY/LinuxDoStar) 的功能设计和实现思路移植为 Tampermonkey 用户脚本。上游 README 声明许可证为 MIT，本仓库同样以 MIT License 发布，并保留上游项目链接与署名说明。
 
 如果你是上游作者并希望调整署名、说明或授权表达，请通过 Issue 联系。
-
-## 发布前检查
-
-当前已通过：
-
-```bash
-node --check linuxdo-star.user.js
-```
-
-建议正式发布前再做一次真实浏览器测试：
-
-- 在 linux.do 帖子页收藏/取消收藏帖子。
-- 收藏/取消收藏多条评论，滚动后确认虚拟列表中的星标状态正常。
-- 新建、编辑、删除收藏夹，移动帖子和评论。
-- 导入导出 JSON。
-- 使用低权限 GitHub Token 连接、立即同步、断开同步。
